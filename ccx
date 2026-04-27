@@ -164,38 +164,335 @@ def clear_env() -> None:
 
 # ── interactive menu ─────────────────────────────────────────
 
-def interactive_switch(cfg: dict) -> str | None:
+def clear_screen() -> None:
+    os.system("clear 2>/dev/null || cls 2>/dev/null")
+
+
+def print_banner() -> None:
+    print(f"""
+{CYAN}╔════════════════════════════════════╗
+║{BOLD}       ccx - Provider Manager       {RESET}{CYAN}║
+╚════════════════════════════════════╝{RESET}
+""")
+
+
+def print_current_status(cfg: dict) -> None:
+    cur = cfg.get("current")
+    if cur and cur in cfg["providers"]:
+        p = cfg["providers"][cur]
+        env = p.get("env", {})
+        url = env.get("ANTHROPIC_BASE_URL", "")
+        model = env.get("ANTHROPIC_MODEL", "")
+        print(f"  {DIM}Current:{RESET}  {BOLD}{GREEN}{p.get('name', cur)}{RESET}")
+        if model:
+            print(f"  {DIM}Model:{RESET}    {model}")
+        print(f"  {DIM}URL:{RESET}      {url}")
+    else:
+        print(f"  {DIM}Current:{RESET}  {YELLOW}Account Login (official){RESET}")
+    print()
+
+
+def interactive_main_menu(cfg: dict) -> str | None:
+    clear_screen()
+    print_banner()
+    print_current_status(cfg)
+
+    print(f"  {BOLD}1{RESET}  Switch provider")
+    print(f"  {BOLD}2{RESET}  Add provider")
+    print(f"  {BOLD}3{RESET}  Remove provider")
+    print(f"  {BOLD}4{RESET}  Reset to account login")
+    print(f"  {BOLD}q{RESET}  Quit")
+    print()
+    try:
+        choice = input(f"  {BOLD}Choose:{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    return choice
+
+
+def interactive_switch(cfg: dict) -> None:
     providers = cfg["providers"]
     if not providers:
-        print(f"{DIM}no providers yet — try `ccx add <name>`{RESET}")
-        return None
+        print(f"\n  {YELLOW}No providers yet. Add one first (option 2).{RESET}")
+        input(f"\n  {DIM}Press Enter to go back...{RESET}")
+        return
+
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Switch Provider{RESET}\n")
+
     cur = cfg.get("current")
     keys = list(providers.keys())
-    print(f"\n  {BOLD}Select a provider:{RESET}\n")
+
     for i, key in enumerate(keys, 1):
         p = providers[key]
         env = p.get("env", {})
         url = env.get("ANTHROPIC_BASE_URL", "?")
-        marker = f"{GREEN}*{RESET}" if key == cur else " "
-        print(f"  {marker} {CYAN}{i}{RESET}  {BOLD}{key}{RESET}  {DIM}({url}){RESET}")
-    print(f"\n  {CYAN}0{RESET}  {DIM}reset (account login){RESET}")
+        model = env.get("ANTHROPIC_MODEL", "")
+        marker = f"{GREEN}●{RESET}" if key == cur else " "
+        model_str = f" {DIM}[{model}]{RESET}" if model else ""
+        print(f"  {marker} {CYAN}{i}{RESET}  {BOLD}{key}{RESET}  {DIM}{url}{RESET}{model_str}")
+
+    print(f"\n  {CYAN}0{RESET}  {DIM}Back to main menu{RESET}")
     print()
+
     try:
         choice = input(f"  {BOLD}Enter number:{RESET} ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        return None
+        return
+
     if choice == "0":
-        return "__reset__"
+        return
+
     try:
         idx = int(choice) - 1
     except ValueError:
-        print(f"{RED}invalid input{RESET}")
-        return None
+        print(f"  {RED}Invalid input{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
     if idx < 0 or idx >= len(keys):
-        print(f"{RED}out of range{RESET}")
-        return None
-    return keys[idx]
+        print(f"  {RED}Out of range{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    name = keys[idx]
+    p = providers[name]
+    env = p.get("env", {})
+    backup_settings()
+    apply_env(env)
+    cfg["current"] = name
+    save_ccx(cfg)
+
+    url = env.get("ANTHROPIC_BASE_URL", "?")
+    model = env.get("ANTHROPIC_MODEL", "")
+    print(f"\n  {GREEN}Switched to {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+    print(f"\n  {YELLOW}Restart Claude Code to apply changes:{RESET}")
+    print(f"  {DIM}• VSCode: Ctrl+Shift+P → Developer: Reload Window{RESET}")
+    print(f"  {DIM}• CLI: exit session, run 'claude'{RESET}")
+    input(f"\n  {DIM}Press Enter...{RESET}")
+
+
+def interactive_add(cfg: dict) -> None:
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Add Provider{RESET}\n")
+    print(f"  {CYAN}1{RESET}  Third-party relay  {DIM}(Zhipu, PackyCode, AnyRouter, etc.){RESET}")
+    print(f"  {CYAN}2{RESET}  Anthropic official  {DIM}(API key from console.anthropic.com){RESET}")
+    print(f"  {CYAN}3{RESET}  Custom")
+    print(f"  {CYAN}0{RESET}  Back")
+    print()
+
+    try:
+        cat = input(f"  {BOLD}Category:{RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if cat == "0" or not cat:
+        return
+
+    if cat == "2":
+        default_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-5"
+    else:
+        default_url = ""
+        default_model = ""
+
+    print()
+    try:
+        name = input(f"  {BOLD}Provider name:{RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not name:
+        print(f"  {RED}Name is required{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        print(f"  {RED}Invalid name (use letters, digits, . _ -){RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    if name in cfg["providers"]:
+        print(f"  {RED}'{name}' already exists. Use 'edit' to modify.{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    try:
+        url = input(f"  {BOLD}API base URL{RESET} [{default_url}]: ").strip()
+        if not url:
+            url = default_url
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not url:
+        print(f"  {RED}URL is required{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    try:
+        token = getpass(f"  {BOLD}API token/key{RESET} (hidden): ")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not token:
+        print(f"  {RED}Token is required{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    try:
+        model = input(f"  {BOLD}Model{RESET} [{default_model}]: ").strip()
+        if not model:
+            model = default_model
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if not model:
+        model = "claude-sonnet-4-5"
+
+    env = {
+        "ANTHROPIC_BASE_URL": url,
+        "ANTHROPIC_AUTH_TOKEN": token,
+        "ANTHROPIC_MODEL": model,
+    }
+
+    cfg["providers"][name] = {"env": env}
+    save_ccx(cfg)
+
+    print(f"\n  {GREEN}Added {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+
+    try:
+        switch_now = input(f"  {BOLD}Switch to it now? [Y/n]:{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if switch_now in ("", "y", "yes"):
+        backup_settings()
+        apply_env(env)
+        cfg["current"] = name
+        save_ccx(cfg)
+        print(f"  {GREEN}Switched to {name}{RESET}")
+        print(f"\n  {YELLOW}Restart Claude Code to apply changes.{RESET}")
+
+    input(f"\n  {DIM}Press Enter...{RESET}")
+
+
+def interactive_remove(cfg: dict) -> None:
+    providers = cfg["providers"]
+    if not providers:
+        print(f"\n  {YELLOW}No providers to remove.{RESET}")
+        input(f"\n  {DIM}Press Enter to go back...{RESET}")
+        return
+
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Remove Provider{RESET}\n")
+
+    cur = cfg.get("current")
+    keys = list(providers.keys())
+
+    for i, key in enumerate(keys, 1):
+        p = providers[key]
+        marker = f"{GREEN}●{RESET}" if key == cur else " "
+        print(f"  {marker} {CYAN}{i}{RESET}  {BOLD}{key}{RESET}")
+
+    print(f"\n  {CYAN}0{RESET}  Back")
+    print()
+
+    try:
+        choice = input(f"  {BOLD}Enter number to remove:{RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if choice == "0":
+        return
+
+    try:
+        idx = int(choice) - 1
+    except ValueError:
+        print(f"  {RED}Invalid input{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    if idx < 0 or idx >= len(keys):
+        print(f"  {RED}Out of range{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    name = keys[idx]
+    try:
+        confirm = input(f"  {BOLD}Remove '{name}'? [y/N]:{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if confirm not in ("y", "yes"):
+        print(f"  {DIM}Cancelled{RESET}")
+        input(f"  {DIM}Press Enter...{RESET}")
+        return
+
+    was_current = cfg.get("current") == name
+    del cfg["providers"][name]
+
+    if was_current:
+        backup_settings()
+        clear_env()
+        cfg["current"] = None
+        print(f"  {GREEN}Removed {name} and cleared env{RESET}")
+    else:
+        print(f"  {GREEN}Removed {name}{RESET}")
+
+    save_ccx(cfg)
+    input(f"  {DIM}Press Enter...{RESET}")
+
+
+def interactive_reset(cfg: dict) -> None:
+    print()
+    try:
+        confirm = input(f"  {BOLD}Reset to account login? [y/N]:{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if confirm not in ("y", "yes"):
+        print(f"  {DIM}Cancelled{RESET}")
+        return
+
+    backup_settings()
+    clear_env()
+    cfg["current"] = None
+    save_ccx(cfg)
+    print(f"\n  {GREEN}Reset to account login{RESET}")
+    print(f"\n  {YELLOW}Restart Claude Code to apply changes:{RESET}")
+    print(f"  {DIM}• VSCode: Ctrl+Shift+P → Developer: Reload Window{RESET}")
+    print(f"  {DIM}• CLI: exit session, run 'claude'{RESET}")
+
+
+def interactive_loop() -> None:
+    cfg = load_ccx()
+    while True:
+        choice = interactive_main_menu(cfg)
+        if choice in ("q", "quit", "exit"):
+            print(f"\n  {DIM}Bye!{RESET}\n")
+            break
+        elif choice == "1":
+            interactive_switch(cfg)
+        elif choice == "2":
+            interactive_add(cfg)
+        elif choice == "3":
+            interactive_remove(cfg)
+        elif choice == "4":
+            interactive_reset(cfg)
 
 
 # ── commands ─────────────────────────────────────────────────
@@ -250,20 +547,7 @@ def cmd_use(args) -> int:
 
     providers = cfg["providers"]
     if name not in providers:
-        # try interactive if no arg given
-        if not args.name or args.name == "":
-            name = interactive_switch(cfg)
-            if name is None:
-                return 0
-            if name == "__reset__":
-                backup_settings()
-                clear_env()
-                cfg["current"] = None
-                save_ccx(cfg)
-                print(f"{GREEN}Switched to account login (env cleared){RESET}")
-                return 0
-        else:
-            die(f"provider '{name}' not found — run `ccx list` to see available")
+        die(f"provider '{name}' not found — run `ccx list` to see available")
 
     p = providers[name]
     env = p.get("env", {})
@@ -491,8 +775,8 @@ def build_parser() -> argparse.ArgumentParser:
     s_cur.set_defaults(func=cmd_current)
 
     # use
-    s_use = sub.add_parser("use", help="switch to a provider (interactive if no name)")
-    s_use.add_argument("name", nargs="?", default="", help="provider name or 'reset'")
+    s_use = sub.add_parser("use", help="switch to a provider")
+    s_use.add_argument("name", help="provider name or 'reset'")
     s_use.set_defaults(func=cmd_use)
 
     # add
@@ -537,30 +821,8 @@ def main() -> int:
     args = parser.parse_args()
 
     if not args.command:
-        # no subcommand → interactive switch
-        cfg = load_ccx()
-        name = interactive_switch(cfg)
-        if name is None:
-            return 0
-        if name == "__reset__":
-            backup_settings()
-            clear_env()
-            cfg["current"] = None
-            save_ccx(cfg)
-            print(f"{GREEN}Switched to account login (env cleared){RESET}")
-            return 0
-        providers = cfg["providers"]
-        if name not in providers:
-            die(f"provider '{name}' not found")
-        p = providers[name]
-        env = p.get("env", {})
-        backup_settings()
-        apply_env(env)
-        cfg["current"] = name
-        save_ccx(cfg)
-        url = env.get("ANTHROPIC_BASE_URL", "?")
-        model = env.get("ANTHROPIC_MODEL", "")
-        print(f"{GREEN}Switched to {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+        # no subcommand → interactive menu
+        interactive_loop()
         return 0
 
     return args.func(args)
