@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """ccx — Claude Code provider switcher (CLI).
 
-Manages multiple Anthropic-compatible API endpoints (AnyRouter, PackyCode,
-official, etc.) and switches between them by rewriting only the `env` block
-of ~/.claude/settings.json. Other top-level keys (hooks, permissions,
-enabledPlugins, ...) are preserved untouched.
+Manages multiple Anthropic-compatible API endpoints and switches between
+them by rewriting only the `env` block of ~/.claude/settings.json.
 
 Storage:  ~/.config/ccx/config.json
 Backups:  ~/.config/ccx/backups/   (last 20 settings.json snapshots)
@@ -17,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -33,8 +32,6 @@ CCX_BACKUPS = CCX_DIR / "backups"
 CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
 CC_SWITCH_DB = HOME / ".cc-switch" / "cc-switch.db"
 
-# Keys that ccx considers its own and will replace on switch.
-# Everything else in `env` is preserved.
 MANAGED_PREFIXES = ("ANTHROPIC_",)
 MANAGED_EXACT = {
     "CLAUDE_CODE_USE_BEDROCK",
@@ -44,12 +41,26 @@ MANAGED_EXACT = {
 
 BACKUP_KEEP = 20
 
+# ───────────────────── ANSI styling ─────────────────────
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+RESET = "\033[0m"
+BG_BLUE = "\033[44m"
+BG_CYAN = "\033[46m"
+
 
 def is_managed(key: str) -> bool:
     return key.startswith(MANAGED_PREFIXES) or key in MANAGED_EXACT
 
 
-# ───────────────────────── IO helpers ─────────────────────────
+# ───────────────────── IO helpers ─────────────────────
 
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +96,50 @@ def die(msg: str, code: int = 1) -> None:
     sys.exit(code)
 
 
-# ───────────────────────── ccx config ─────────────────────────
+def prompt(text: str, default: str = "") -> str:
+    hint = f" [{default}]" if default else ""
+    try:
+        v = input(f"{CYAN}{text}{hint}{RESET}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    return v or default
+
+
+def prompt_choice(text: str, choices: list[str]) -> str:
+    while True:
+        v = prompt(text)
+        if v in choices:
+            return v
+        print(f"  {DIM}please enter one of: {', '.join(choices)}{RESET}")
+
+
+def confirm(text: str, default: bool = False) -> bool:
+    hint = "Y/n" if default else "y/N"
+    v = prompt(f"{text} ({hint})")
+    if not v:
+        return default
+    return v.lower() in ("y", "yes")
+
+
+def mask(value: str) -> str:
+    if not isinstance(value, str):
+        return str(value)
+    if len(value) <= 14:
+        return "***"
+    return f"{value[:8]}...{value[-4:]}"
+
+
+def looks_secret(key: str) -> bool:
+    k = key.upper()
+    return "TOKEN" in k or "KEY" in k or "SECRET" in k
+
+
+def clear_screen() -> None:
+    os.system("clear 2>/dev/null || cls 2>/dev/null")
+
+
+# ───────────────────── ccx config ─────────────────────
 
 def load_ccx() -> dict:
     cfg = read_json(CCX_CONFIG, {"current": None, "providers": {}})
@@ -98,7 +152,7 @@ def save_ccx(cfg: dict) -> None:
     atomic_write_json(CCX_CONFIG, cfg)
 
 
-# ───────────────────────── switching ─────────────────────────
+# ───────────────────── switching ─────────────────────
 
 def backup_settings() -> Path | None:
     if not CLAUDE_SETTINGS.exists():
@@ -117,7 +171,6 @@ def backup_settings() -> Path | None:
 
 
 def apply_env(provider_env: dict) -> None:
-    """Replace managed keys in ~/.claude/settings.json env block."""
     settings = read_json(CLAUDE_SETTINGS, {}) if CLAUDE_SETTINGS.exists() else {}
     if not isinstance(settings, dict):
         die(f"{CLAUDE_SETTINGS} is not a JSON object")
@@ -131,20 +184,324 @@ def apply_env(provider_env: dict) -> None:
     atomic_write_json(CLAUDE_SETTINGS, settings)
 
 
-def mask(value: str) -> str:
-    if not isinstance(value, str):
-        return str(value)
-    if len(value) <= 14:
-        return "***"
-    return f"{value[:8]}…{value[-4:]}"
+def do_switch(cfg: dict, name: str) -> None:
+    p = cfg["providers"].get(name)
+    if not p:
+        die(f"provider '{name}' not found")
+    backup = backup_settings()
+    apply_env(p.get("env") or {})
+    cfg["current"] = name
+    save_ccx(cfg)
+    print(f"\n  {GREEN}Switched to {BOLD}{p.get('name', name)}{RESET}")
+    if backup:
+        print(f"  {DIM}backup: {backup}{RESET}")
 
 
-def looks_secret(key: str) -> bool:
-    k = key.upper()
-    return "TOKEN" in k or "KEY" in k or "SECRET" in k
+def do_reset(cfg: dict) -> None:
+    if not CLAUDE_SETTINGS.exists():
+        print(f"  {DIM}no settings.json to reset{RESET}")
+        return
+    backup = backup_settings()
+    apply_env({})
+    cfg["current"] = None
+    save_ccx(cfg)
+    print(f"\n  {GREEN}Reset to account login{RESET}")
+    if backup:
+        print(f"  {DIM}backup: {backup}{RESET}")
 
 
-# ───────────────────────── commands ─────────────────────────
+# ───────────────────── Claude Code restart ─────────────────────
+
+def find_claude_pids() -> list[int]:
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-f", "claude"], text=True, stderr=subprocess.DEVNULL
+        )
+        return [int(x) for x in out.strip().splitlines() if x.strip()]
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+
+
+def kill_claude() -> bool:
+    pids = find_claude_pids()
+    if not pids:
+        return True
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    time.sleep(0.5)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    return True
+
+
+def launch_claude() -> None:
+    subprocess.Popen(
+        ["claude"],
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+
+
+# ───────────────────── interactive menu ─────────────────────
+
+def print_banner() -> None:
+    print(f"""
+{BG_BLUE}{BOLD}  ccx  {RESET}  {DIM}Claude Code Provider Switcher{RESET}
+""")
+
+
+def print_current_status(cfg: dict) -> None:
+    cur = cfg.get("current")
+    if cur and cur in cfg["providers"]:
+        p = cfg["providers"][cur]
+        url = (p.get("env") or {}).get("ANTHROPIC_BASE_URL", "")
+        model = (p.get("env") or {}).get("ANTHROPIC_MODEL", "")
+        print(f"  {DIM}Current:{RESET}  {BOLD}{GREEN}{p.get('name', cur)}{RESET}  {DIM}{url}{RESET}")
+        if model:
+            print(f"  {DIM}Model:{RESET}    {model}")
+    else:
+        print(f"  {DIM}Current:{RESET}  {YELLOW}Account Login (official){RESET}")
+    print()
+
+
+def menu_main(cfg: dict) -> str | None:
+    clear_screen()
+    print_banner()
+    print_current_status(cfg)
+
+    print(f"  {BOLD}1{RESET}  Switch provider")
+    print(f"  {BOLD}2{RESET}  Add provider")
+    print(f"  {BOLD}3{RESET}  Remove provider")
+    print(f"  {BOLD}4{RESET}  Reset to account login")
+    print(f"  {BOLD}q{RESET}  Quit")
+    print()
+    return prompt("Choose")
+
+
+def menu_switch(cfg: dict) -> None:
+    providers = cfg["providers"]
+    if not providers:
+        print(f"\n  {YELLOW}No providers yet. Add one first.{RESET}")
+        prompt("Press Enter to go back")
+        return
+
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Switch Provider{RESET}\n")
+
+    keys = list(providers.keys())
+    cur = cfg.get("current")
+
+    for i, key in enumerate(keys, 1):
+        p = providers[key]
+        marker = f"{GREEN}*{RESET}" if key == cur else " "
+        url = (p.get("env") or {}).get("ANTHROPIC_BASE_URL", "")
+        model = (p.get("env") or {}).get("ANTHROPIC_MODEL", "")
+        line = f"  {marker} {BOLD}{i}{RESET}  {p.get('name', key)}"
+        if model:
+            line += f"  {DIM}({model}){RESET}"
+        line += f"  {DIM}{url}{RESET}"
+        print(line)
+
+    print(f"\n  {BOLD}0{RESET}  Back to main menu")
+    print()
+
+    choice = prompt("Choose")
+    if choice == "0" or not choice:
+        return
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(keys):
+            name = keys[idx]
+            do_switch(cfg, name)
+            if confirm("Restart Claude Code now?", default=True):
+                kill_claude()
+                time.sleep(0.3)
+                print(f"\n  {DIM}Launching claude...{RESET}")
+                launch_claude()
+                return
+        else:
+            print(f"  {RED}Invalid choice{RESET}")
+    except ValueError:
+        print(f"  {RED}Invalid input{RESET}")
+
+    prompt("Press Enter to go back")
+
+
+def menu_add(cfg: dict) -> None:
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Add Provider{RESET}\n")
+    print(f"  {BOLD}1{RESET}  Third-party relay  {DIM}(AnyRouter, PackyCode, Zhipu, etc.){RESET}")
+    print(f"  {BOLD}2{RESET}  Anthropic official  {DIM}(API key from console.anthropic.com){RESET}")
+    print(f"  {BOLD}3{RESET}  Custom  {DIM}(manual env config){RESET}")
+    print(f"  {BOLD}0{RESET}  Back")
+    print()
+
+    cat = prompt("Category")
+    if cat == "0" or not cat:
+        return
+
+    if cat == "2":
+        default_url = "https://api.anthropic.com"
+        default_model = "claude-sonnet-4-5"
+        token_label = "API Key"
+        api_key_field = "ANTHROPIC_API_KEY"
+    elif cat == "3":
+        default_url = ""
+        default_model = ""
+        token_label = "Token / API Key"
+        api_key_field = "ANTHROPIC_AUTH_TOKEN"
+    else:
+        default_url = ""
+        default_model = ""
+        token_label = "Token / API Key"
+        api_key_field = "ANTHROPIC_AUTH_TOKEN"
+
+    name = prompt("Provider name (e.g. zhipu, packy)")
+    if not name:
+        print(f"  {RED}Name is required{RESET}")
+        prompt("Press Enter to go back")
+        return
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        print(f"  {RED}Invalid name (use letters/digits/._-){RESET}")
+        prompt("Press Enter to go back")
+        return
+    if name in cfg["providers"]:
+        if not confirm(f"'{name}' already exists. Overwrite?", default=False):
+            return
+
+    url = prompt("ANTHROPIC_BASE_URL", default=default_url)
+    if not url:
+        print(f"  {RED}URL is required{RESET}")
+        prompt("Press Enter to go back")
+        return
+
+    token = getpass(f"  {CYAN}{token_label}{RESET} (input hidden): ").strip()
+    if not token:
+        print(f"  {RED}Token is required{RESET}")
+        prompt("Press Enter to go back")
+        return
+
+    model = prompt("ANTHROPIC_MODEL", default=default_model)
+
+    env: dict[str, str] = {
+        "ANTHROPIC_BASE_URL": url,
+    }
+    if api_key_field == "ANTHROPIC_API_KEY":
+        env["ANTHROPIC_API_KEY"] = token
+    else:
+        env["ANTHROPIC_AUTH_TOKEN"] = token
+    if model:
+        env["ANTHROPIC_MODEL"] = model
+
+    display_name = prompt("Display name", default=name)
+
+    cfg["providers"][name] = {
+        "name": display_name,
+        "env": env,
+    }
+    save_ccx(cfg)
+    print(f"\n  {GREEN}Added {display_name}{RESET}")
+
+    if confirm("Switch to this provider now?", default=True):
+        do_switch(cfg, name)
+        if confirm("Restart Claude Code now?", default=True):
+            kill_claude()
+            time.sleep(0.3)
+            print(f"\n  {DIM}Launching claude...{RESET}")
+            launch_claude()
+            return
+
+    prompt("Press Enter to go back")
+
+
+def menu_remove(cfg: dict) -> None:
+    providers = cfg["providers"]
+    if not providers:
+        print(f"\n  {YELLOW}No providers to remove.{RESET}")
+        prompt("Press Enter to go back")
+        return
+
+    clear_screen()
+    print_banner()
+    print(f"  {BOLD}Remove Provider{RESET}\n")
+
+    keys = list(providers.keys())
+    cur = cfg.get("current")
+
+    for i, key in enumerate(keys, 1):
+        p = providers[key]
+        marker = f"{GREEN}*{RESET}" if key == cur else " "
+        print(f"  {marker} {BOLD}{i}{RESET}  {p.get('name', key)}")
+
+    print(f"\n  {BOLD}0{RESET}  Back")
+    print()
+
+    choice = prompt("Choose")
+    if choice == "0" or not choice:
+        return
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(keys):
+            name = keys[idx]
+            p = providers[name]
+            if confirm(f"Remove {p.get('name', name)}?", default=False):
+                was_current = cfg.get("current") == name
+                del cfg["providers"][name]
+                if was_current:
+                    cfg["current"] = None
+                    backup = backup_settings()
+                    apply_env({})
+                    print(f"\n  {GREEN}Removed {name} and cleared env{RESET}")
+                    if backup:
+                        print(f"  {DIM}backup: {backup}{RESET}")
+                else:
+                    print(f"\n  {GREEN}Removed {name}{RESET}")
+                save_ccx(cfg)
+        else:
+            print(f"  {RED}Invalid choice{RESET}")
+    except ValueError:
+        print(f"  {RED}Invalid input{RESET}")
+
+    prompt("Press Enter to go back")
+
+
+def interactive() -> None:
+    cfg = load_ccx()
+    while True:
+        choice = menu_main(cfg)
+        if choice in ("q", "Q", "quit", "exit"):
+            print(f"\n  {DIM}Bye!{RESET}\n")
+            break
+        elif choice == "1":
+            menu_switch(cfg)
+        elif choice == "2":
+            menu_add(cfg)
+        elif choice == "3":
+            menu_remove(cfg)
+        elif choice == "4":
+            if confirm("Reset to account login?", default=False):
+                do_reset(cfg)
+                if confirm("Restart Claude Code now?", default=True):
+                    kill_claude()
+                    time.sleep(0.3)
+                    print(f"\n  {DIM}Launching claude...{RESET}")
+                    launch_claude()
+                    break
+            prompt("Press Enter to go back")
+        else:
+            pass  # redisplay menu
+
+
+# ───────────────────── CLI commands ─────────────────────
 
 def cmd_list(_args) -> int:
     cfg = load_ccx()
@@ -230,30 +587,17 @@ def cmd_add(args) -> int:
         "env": env,
     }
     save_ccx(cfg)
-    print(f"✓ added {name}")
+    print(f"added {name}")
 
     if args.use or cfg.get("current") is None:
-        return _switch_to(cfg, name)
+        do_switch(cfg, name)
     print(f"hint: ccx use {name}")
     return 0
 
 
 def cmd_use(args) -> int:
     cfg = load_ccx()
-    return _switch_to(cfg, args.name)
-
-
-def _switch_to(cfg: dict, name: str) -> int:
-    p = cfg["providers"].get(name)
-    if not p:
-        die(f"provider '{name}' not found (try `ccx list`)")
-    backup = backup_settings()
-    apply_env(p.get("env") or {})
-    cfg["current"] = name
-    save_ccx(cfg)
-    print(f"✓ switched to {name} ({p.get('name', name)})")
-    if backup:
-        print(f"  backup: {backup}")
+    do_switch(cfg, args.name)
     return 0
 
 
@@ -266,13 +610,13 @@ def cmd_rm(args) -> int:
     if was_current:
         cfg["current"] = None
     save_ccx(cfg)
-    print(f"✓ removed {args.name}")
+    print(f"removed {args.name}")
     if was_current:
         backup = backup_settings()
-        apply_env({})  # strips managed keys from live settings
-        print(f"  cleared managed env keys from {CLAUDE_SETTINGS}")
+        apply_env({})
+        print(f"cleared managed env keys from {CLAUDE_SETTINGS}")
         if backup:
-            print(f"  backup: {backup}")
+            print(f"backup: {backup}")
     return 0
 
 
@@ -281,7 +625,7 @@ def cmd_show(args) -> int:
     p = cfg["providers"].get(args.name)
     if not p:
         die(f"'{args.name}' not found")
-    out = json.loads(json.dumps(p))  # deep copy
+    out = json.loads(json.dumps(p))
     if not args.reveal:
         for k, v in (out.get("env") or {}).items():
             if looks_secret(k):
@@ -311,16 +655,33 @@ def cmd_edit(args) -> int:
             die("edited JSON must be an object with an `env` key")
         cfg["providers"][args.name] = new
         save_ccx(cfg)
-        print(f"✓ updated {args.name}")
+        print(f"updated {args.name}")
         if cfg.get("current") == args.name:
-            print(f"  (re-applying since {args.name} is current)")
-            return _switch_to(cfg, args.name)
+            print(f"(re-applying since {args.name} is current)")
+            return 0
+            do_switch(cfg, args.name)
         return 0
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
+
+
+def cmd_reset(_args) -> int:
+    cfg = load_ccx()
+    if not CLAUDE_SETTINGS.exists():
+        print("no settings.json to reset")
+        return 0
+    backup = backup_settings()
+    apply_env({})
+    cfg["current"] = None
+    save_ccx(cfg)
+    print(f"reset: cleared managed env keys from {CLAUDE_SETTINGS}")
+    print("Claude Code will now use your logged-in account.")
+    if backup:
+        print(f"backup: {backup}")
+    return 0
 
 
 def sanitize_key(name: str) -> str:
@@ -333,23 +694,6 @@ def sanitize_key(name: str) -> str:
         else:
             out.append("-")
     return re.sub(r"-+", "-", "".join(out)).strip("-_") or "imported"
-
-
-def cmd_reset(_args) -> int:
-    """Clear managed env keys from settings.json to revert to account login."""
-    cfg = load_ccx()
-    if not CLAUDE_SETTINGS.exists():
-        print("no settings.json to reset")
-        return 0
-    backup = backup_settings()
-    apply_env({})
-    cfg["current"] = None
-    save_ccx(cfg)
-    print(f"✓ reset: cleared managed env keys from {CLAUDE_SETTINGS}")
-    print("  Claude Code will now use your logged-in account.")
-    if backup:
-        print(f"  backup: {backup}")
-    return 0
 
 
 def cmd_import_cc_switch(_args) -> int:
@@ -391,21 +735,25 @@ def cmd_import_cc_switch(_args) -> int:
         imported += 1
         print(f"  + {key}: {name}")
     save_ccx(cfg)
-    print(f"✓ imported {imported} provider(s) into {CCX_CONFIG}")
+    print(f"imported {imported} provider(s) into {CCX_CONFIG}")
     if cfg.get("current"):
         print(f"  current is set to '{cfg['current']}' but live config is NOT yet applied.")
         print(f"  run `ccx use {cfg['current']}` to write it to {CLAUDE_SETTINGS}.")
     return 0
 
 
-# ───────────────────────── argparse plumbing ─────────────────────────
+# ───────────────────── argparse ─────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ccx",
-        description="Claude Code provider switcher (CLI replacement for cc-switch).",
+        description="Claude Code provider switcher.",
     )
-    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+    p.add_argument(
+        "-i", "--interactive", action="store_true",
+        help="launch interactive menu (default when run with no arguments)",
+    )
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
     s = sub.add_parser("list", aliases=["ls"], help="list providers")
     s.set_defaults(func=cmd_list)
@@ -417,8 +765,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("add", help="add a provider")
     s.add_argument("name")
     s.add_argument("--url", help="ANTHROPIC_BASE_URL")
-    s.add_argument("--token", help="ANTHROPIC_AUTH_TOKEN (or API key, see --api-key-field)")
-    s.add_argument("--display-name", help="human-readable name (default: same as name)")
+    s.add_argument("--token", help="ANTHROPIC_AUTH_TOKEN (or API key)")
+    s.add_argument("--display-name", help="human-readable name")
     s.add_argument("--model", help="ANTHROPIC_MODEL")
     s.add_argument("--haiku", help="ANTHROPIC_DEFAULT_HAIKU_MODEL")
     s.add_argument("--sonnet", help="ANTHROPIC_DEFAULT_SONNET_MODEL")
@@ -427,11 +775,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--api-key-field",
         choices=["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
         default="ANTHROPIC_AUTH_TOKEN",
-        help="which env key to store the token under (default: AUTH_TOKEN)",
     )
-    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="extra env (repeatable)")
-    s.add_argument("--use", action="store_true", help="switch to this provider after adding")
-    s.add_argument("--force", action="store_true", help="overwrite if name exists")
+    s.add_argument("--env", action="append", metavar="KEY=VALUE")
+    s.add_argument("--use", action="store_true", help="switch after adding")
+    s.add_argument("--force", action="store_true", help="overwrite if exists")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser("rm", aliases=["remove"], help="remove a provider")
@@ -441,31 +788,41 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("current", help="show current provider")
     s.set_defaults(func=cmd_current)
 
-    s = sub.add_parser("show", help="show provider details (secrets masked)")
+    s = sub.add_parser("show", help="show provider details")
     s.add_argument("name")
-    s.add_argument("--reveal", action="store_true", help="show full token/key values")
+    s.add_argument("--reveal", action="store_true")
     s.set_defaults(func=cmd_show)
 
     s = sub.add_parser("edit", help="edit provider JSON in $EDITOR")
     s.add_argument("name")
     s.set_defaults(func=cmd_edit)
 
-    s = sub.add_parser(
-        "import-cc-switch", help="import providers from ~/.cc-switch/cc-switch.db"
-    )
-    s.set_defaults(func=cmd_import_cc_switch)
+    s = sub.add_parser("reset", help="revert to account login")
+    s.set_defaults(func=cmd_reset)
 
     s = sub.add_parser(
-        "reset", help="clear env and revert to Claude Code account login"
+        "import-cc-switch", help="import from ~/.cc-switch/cc-switch.db"
     )
-    s.set_defaults(func=cmd_reset)
+    s.set_defaults(func=cmd_import_cc_switch)
 
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+
+    # No arguments → interactive menu
+    if not argv and len(sys.argv) == 1:
+        interactive()
+        return 0
+
     args = parser.parse_args(argv)
+
+    # -i flag or no subcommand → interactive
+    if getattr(args, "interactive", False) or not hasattr(args, "func"):
+        interactive()
+        return 0
+
     return args.func(args)
 
 
