@@ -335,6 +335,23 @@ def sanitize_key(name: str) -> str:
     return re.sub(r"-+", "-", "".join(out)).strip("-_") or "imported"
 
 
+def cmd_reset(_args) -> int:
+    """Clear managed env keys from settings.json to revert to account login."""
+    cfg = load_ccx()
+    if not CLAUDE_SETTINGS.exists():
+        print("no settings.json to reset")
+        return 0
+    backup = backup_settings()
+    apply_env({})
+    cfg["current"] = None
+    save_ccx(cfg)
+    print(f"✓ reset: cleared managed env keys from {CLAUDE_SETTINGS}")
+    print("  Claude Code will now use your logged-in account.")
+    if backup:
+        print(f"  backup: {backup}")
+    return 0
+
+
 def cmd_import_cc_switch(_args) -> int:
     if not CC_SWITCH_DB.exists():
         die(f"{CC_SWITCH_DB} not found")
@@ -437,6 +454,11 @@ def build_parser() -> argparse.ArgumentParser:
         "import-cc-switch", help="import providers from ~/.cc-switch/cc-switch.db"
     )
     s.set_defaults(func=cmd_import_cc_switch)
+
+    s = sub.add_parser(
+        "reset", help="clear env and revert to Claude Code account login"
+    )
+    s.set_defaults(func=cmd_reset)
 
     return p
 
