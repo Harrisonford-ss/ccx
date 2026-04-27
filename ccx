@@ -269,9 +269,7 @@ def interactive_switch(cfg: dict) -> None:
     url = env.get("ANTHROPIC_BASE_URL", "?")
     model = env.get("ANTHROPIC_MODEL", "")
     print(f"\n  {GREEN}Switched to {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
-    print(f"\n  {YELLOW}Restart Claude Code to apply changes:{RESET}")
-    print(f"  {DIM}• VSCode: Ctrl+Shift+P → Developer: Reload Window{RESET}")
-    print(f"  {DIM}• CLI: exit session, run 'claude'{RESET}")
+    print(f"\n  {YELLOW}Next: close VSCode, reopen it, start a new chat.{RESET}")
     input(f"\n  {DIM}Press Enter...{RESET}")
 
 
@@ -381,7 +379,7 @@ def interactive_add(cfg: dict) -> None:
         cfg["current"] = name
         save_ccx(cfg)
         print(f"  {GREEN}Switched to {name}{RESET}")
-        print(f"\n  {YELLOW}Restart Claude Code to apply changes.{RESET}")
+        print(f"\n  {YELLOW}Next: close VSCode, reopen it, start a new chat.{RESET}")
 
     input(f"\n  {DIM}Press Enter...{RESET}")
 
@@ -473,9 +471,7 @@ def interactive_reset(cfg: dict) -> None:
     cfg["current"] = None
     save_ccx(cfg)
     print(f"\n  {GREEN}Reset to account login{RESET}")
-    print(f"\n  {YELLOW}Restart Claude Code to apply changes:{RESET}")
-    print(f"  {DIM}• VSCode: Ctrl+Shift+P → Developer: Reload Window{RESET}")
-    print(f"  {DIM}• CLI: exit session, run 'claude'{RESET}")
+    print(f"\n  {YELLOW}Next: close VSCode, reopen it, start a new chat.{RESET}")
 
 
 def interactive_loop() -> None:
@@ -558,6 +554,7 @@ def cmd_use(args) -> int:
     url = env.get("ANTHROPIC_BASE_URL", "?")
     model = env.get("ANTHROPIC_MODEL", "")
     print(f"{GREEN}Switched to {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+    print(f"\n{YELLOW}Next: close VSCode, reopen it, start a new chat.{RESET}")
     return 0
 
 
@@ -747,7 +744,8 @@ def cmd_reset(_args) -> int:
     clear_env()
     cfg["current"] = None
     save_ccx(cfg)
-    print(f"{GREEN}Reset to account login (env cleared){RESET}")
+    print(f"{GREEN}Reset to account login{RESET}")
+    print(f"\n{YELLOW}Next: close VSCode, reopen it, start a new chat.{RESET}")
     return 0
 
 
