@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+"""ccx — Claude Code provider switcher (CLI).
+
+Manages multiple Anthropic-compatible API endpoints (AnyRouter, PackyCode,
+official, etc.) and switches between them by rewriting only the `env` block
+of ~/.claude/settings.json. Other top-level keys (hooks, permissions,
+enabledPlugins, ...) are preserved untouched.
+
+Storage:  ~/.config/ccx/config.json
+Backups:  ~/.config/ccx/backups/   (last 20 settings.json snapshots)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from getpass import getpass
+from pathlib import Path
+from typing import Any
+
+HOME = Path.home()
+CCX_DIR = HOME / ".config" / "ccx"
+CCX_CONFIG = CCX_DIR / "config.json"
+CCX_BACKUPS = CCX_DIR / "backups"
+CLAUDE_SETTINGS = HOME / ".claude" / "settings.json"
+CC_SWITCH_DB = HOME / ".cc-switch" / "cc-switch.db"
+
+# Keys that ccx considers its own and will replace on switch.
+# Everything else in `env` is preserved.
+MANAGED_PREFIXES = ("ANTHROPIC_",)
+MANAGED_EXACT = {
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_API_KEY_HELPER_TTL_MS",
+}
+
+BACKUP_KEEP = 20
+
+
+def is_managed(key: str) -> bool:
+    return key.startswith(MANAGED_PREFIXES) or key in MANAGED_EXACT
+
+
+# ───────────────────────── IO helpers ─────────────────────────
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        try:
+            os.chmod(tmp, os.stat(path).st_mode)
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path: Path, data: Any) -> None:
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def read_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"failed to parse {path}: {e}")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"ccx: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# ───────────────────────── ccx config ─────────────────────────
+
+def load_ccx() -> dict:
+    cfg = read_json(CCX_CONFIG, {"current": None, "providers": {}})
+    cfg.setdefault("current", None)
+    cfg.setdefault("providers", {})
+    return cfg
+
+
+def save_ccx(cfg: dict) -> None:
+    atomic_write_json(CCX_CONFIG, cfg)
+
+
+# ───────────────────────── switching ─────────────────────────
+
+def backup_settings() -> Path | None:
+    if not CLAUDE_SETTINGS.exists():
+        return None
+    CCX_BACKUPS.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    dst = CCX_BACKUPS / f"settings.json.{ts}"
+    shutil.copy2(CLAUDE_SETTINGS, dst)
+    snapshots = sorted(CCX_BACKUPS.glob("settings.json.*"))
+    for old in snapshots[:-BACKUP_KEEP]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return dst
+
+
+def apply_env(provider_env: dict) -> None:
+    """Replace managed keys in ~/.claude/settings.json env block."""
+    settings = read_json(CLAUDE_SETTINGS, {}) if CLAUDE_SETTINGS.exists() else {}
+    if not isinstance(settings, dict):
+        die(f"{CLAUDE_SETTINGS} is not a JSON object")
+    cur_env = settings.get("env") or {}
+    if not isinstance(cur_env, dict):
+        die("settings.json `env` is not an object")
+    new_env = {k: v for k, v in cur_env.items() if not is_managed(k)}
+    for k, v in provider_env.items():
+        new_env[k] = v
+    settings["env"] = new_env
+    atomic_write_json(CLAUDE_SETTINGS, settings)
+
+
+def mask(value: str) -> str:
+    if not isinstance(value, str):
+        return str(value)
+    if len(value) <= 14:
+        return "***"
+    return f"{value[:8]}…{value[-4:]}"
+
+
+def looks_secret(key: str) -> bool:
+    k = key.upper()
+    return "TOKEN" in k or "KEY" in k or "SECRET" in k
+
+
+# ───────────────────────── commands ─────────────────────────
+
+def cmd_list(_args) -> int:
+    cfg = load_ccx()
+    providers = cfg["providers"]
+    if not providers:
+        print("no providers yet — try `ccx add <name>` or `ccx import-cc-switch`")
+        return 0
+    cur = cfg.get("current")
+    name_w = max(len(n) for n in providers)
+    for key, p in providers.items():
+        marker = "*" if key == cur else " "
+        url = (p.get("env") or {}).get("ANTHROPIC_BASE_URL", "")
+        display = p.get("name", "")
+        print(f"{marker} {key.ljust(name_w)}  {display}  {url}")
+    return 0
+
+
+def cmd_current(_args) -> int:
+    cfg = load_ccx()
+    cur = cfg.get("current")
+    if not cur:
+        print("(none)")
+        return 0
+    p = cfg["providers"].get(cur)
+    if not p:
+        print(f"{cur}  (warning: provider record missing)")
+        return 1
+    print(cur)
+    for k, v in (p.get("env") or {}).items():
+        shown = mask(v) if looks_secret(k) else v
+        print(f"  {k}={shown}")
+    return 0
+
+
+def parse_env_pair(raw: str) -> tuple[str, str]:
+    if "=" not in raw:
+        die(f"--env expects KEY=VALUE, got: {raw!r}")
+    k, v = raw.split("=", 1)
+    k = k.strip()
+    if not k:
+        die(f"--env has empty key: {raw!r}")
+    return k, v
+
+
+def cmd_add(args) -> int:
+    cfg = load_ccx()
+    name = args.name
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        die(f"invalid name '{name}' (use letters/digits/._-)")
+    if name in cfg["providers"] and not args.force:
+        die(f"'{name}' already exists. Use --force to overwrite.")
+
+    url = args.url or input("ANTHROPIC_BASE_URL: ").strip()
+    if not url:
+        die("url is required")
+    token = args.token
+    if token is None:
+        token = getpass("ANTHROPIC_AUTH_TOKEN (input hidden): ").strip()
+    if not token:
+        die("token is required")
+
+    env: dict[str, str] = {
+        "ANTHROPIC_BASE_URL": url,
+        "ANTHROPIC_AUTH_TOKEN": token,
+    }
+    if args.api_key_field == "ANTHROPIC_API_KEY":
+        env.pop("ANTHROPIC_AUTH_TOKEN")
+        env["ANTHROPIC_API_KEY"] = token
+    if args.model:
+        env["ANTHROPIC_MODEL"] = args.model
+    if args.haiku:
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = args.haiku
+    if args.sonnet:
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = args.sonnet
+    if args.opus:
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = args.opus
+    for raw in args.env or []:
+        k, v = parse_env_pair(raw)
+        env[k] = v
+
+    cfg["providers"][name] = {
+        "name": args.display_name or name,
+        "env": env,
+    }
+    save_ccx(cfg)
+    print(f"✓ added {name}")
+
+    if args.use or cfg.get("current") is None:
+        return _switch_to(cfg, name)
+    print(f"hint: ccx use {name}")
+    return 0
+
+
+def cmd_use(args) -> int:
+    cfg = load_ccx()
+    return _switch_to(cfg, args.name)
+
+
+def _switch_to(cfg: dict, name: str) -> int:
+    p = cfg["providers"].get(name)
+    if not p:
+        die(f"provider '{name}' not found (try `ccx list`)")
+    backup = backup_settings()
+    apply_env(p.get("env") or {})
+    cfg["current"] = name
+    save_ccx(cfg)
+    print(f"✓ switched to {name} ({p.get('name', name)})")
+    if backup:
+        print(f"  backup: {backup}")
+    return 0
+
+
+def cmd_rm(args) -> int:
+    cfg = load_ccx()
+    if args.name not in cfg["providers"]:
+        die(f"'{args.name}' not found")
+    was_current = cfg.get("current") == args.name
+    del cfg["providers"][args.name]
+    if was_current:
+        cfg["current"] = None
+    save_ccx(cfg)
+    print(f"✓ removed {args.name}")
+    if was_current:
+        backup = backup_settings()
+        apply_env({})  # strips managed keys from live settings
+        print(f"  cleared managed env keys from {CLAUDE_SETTINGS}")
+        if backup:
+            print(f"  backup: {backup}")
+    return 0
+
+
+def cmd_show(args) -> int:
+    cfg = load_ccx()
+    p = cfg["providers"].get(args.name)
+    if not p:
+        die(f"'{args.name}' not found")
+    out = json.loads(json.dumps(p))  # deep copy
+    if not args.reveal:
+        for k, v in (out.get("env") or {}).items():
+            if looks_secret(k):
+                out["env"][k] = mask(v)
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_edit(args) -> int:
+    cfg = load_ccx()
+    if args.name not in cfg["providers"]:
+        die(f"'{args.name}' not found")
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "nano"
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=f".ccx-{args.name}.json", delete=False, encoding="utf-8"
+    ) as tf:
+        json.dump(cfg["providers"][args.name], tf, indent=2, ensure_ascii=False)
+        tf.write("\n")
+        path = tf.name
+    try:
+        rc = subprocess.call([editor, path])
+        if rc != 0:
+            die(f"editor exited with {rc}; aborting", code=rc)
+        with open(path, encoding="utf-8") as f:
+            new = json.load(f)
+        if not isinstance(new, dict) or "env" not in new:
+            die("edited JSON must be an object with an `env` key")
+        cfg["providers"][args.name] = new
+        save_ccx(cfg)
+        print(f"✓ updated {args.name}")
+        if cfg.get("current") == args.name:
+            print(f"  (re-applying since {args.name} is current)")
+            return _switch_to(cfg, args.name)
+        return 0
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def sanitize_key(name: str) -> str:
+    out: list[str] = []
+    for c in name:
+        if c.isalnum():
+            out.append(c.lower())
+        elif c in "-_":
+            out.append(c)
+        else:
+            out.append("-")
+    return re.sub(r"-+", "-", "".join(out)).strip("-_") or "imported"
+
+
+def cmd_import_cc_switch(_args) -> int:
+    if not CC_SWITCH_DB.exists():
+        die(f"{CC_SWITCH_DB} not found")
+    cfg = load_ccx()
+    db = sqlite3.connect(CC_SWITCH_DB)
+    try:
+        rows = db.execute(
+            "SELECT id, name, settings_config, is_current "
+            "FROM providers WHERE app_type='claude'"
+        ).fetchall()
+    except sqlite3.DatabaseError as e:
+        die(f"db error: {e}")
+    finally:
+        db.close()
+
+    if not rows:
+        print("cc-switch has no Claude providers; nothing to import")
+        return 0
+
+    imported = 0
+    for pid, name, cfg_json, is_current in rows:
+        try:
+            sc = json.loads(cfg_json) if cfg_json else {}
+        except json.JSONDecodeError:
+            print(f"  skip {name}: invalid JSON in settings_config", file=sys.stderr)
+            continue
+        env = sc.get("env") or {}
+        if not env:
+            print(f"  skip {name}: no env block", file=sys.stderr)
+            continue
+        key = sanitize_key(name)
+        if key in cfg["providers"]:
+            key = f"{key}-{pid[:6]}"
+        cfg["providers"][key] = {"name": name, "env": env}
+        if is_current and not cfg.get("current"):
+            cfg["current"] = key
+        imported += 1
+        print(f"  + {key}: {name}")
+    save_ccx(cfg)
+    print(f"✓ imported {imported} provider(s) into {CCX_CONFIG}")
+    if cfg.get("current"):
+        print(f"  current is set to '{cfg['current']}' but live config is NOT yet applied.")
+        print(f"  run `ccx use {cfg['current']}` to write it to {CLAUDE_SETTINGS}.")
+    return 0
+
+
+# ───────────────────────── argparse plumbing ─────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="ccx",
+        description="Claude Code provider switcher (CLI replacement for cc-switch).",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="<command>")
+
+    s = sub.add_parser("list", aliases=["ls"], help="list providers")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("use", help="switch active provider")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_use)
+
+    s = sub.add_parser("add", help="add a provider")
+    s.add_argument("name")
+    s.add_argument("--url", help="ANTHROPIC_BASE_URL")
+    s.add_argument("--token", help="ANTHROPIC_AUTH_TOKEN (or API key, see --api-key-field)")
+    s.add_argument("--display-name", help="human-readable name (default: same as name)")
+    s.add_argument("--model", help="ANTHROPIC_MODEL")
+    s.add_argument("--haiku", help="ANTHROPIC_DEFAULT_HAIKU_MODEL")
+    s.add_argument("--sonnet", help="ANTHROPIC_DEFAULT_SONNET_MODEL")
+    s.add_argument("--opus", help="ANTHROPIC_DEFAULT_OPUS_MODEL")
+    s.add_argument(
+        "--api-key-field",
+        choices=["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"],
+        default="ANTHROPIC_AUTH_TOKEN",
+        help="which env key to store the token under (default: AUTH_TOKEN)",
+    )
+    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="extra env (repeatable)")
+    s.add_argument("--use", action="store_true", help="switch to this provider after adding")
+    s.add_argument("--force", action="store_true", help="overwrite if name exists")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("rm", aliases=["remove"], help="remove a provider")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_rm)
+
+    s = sub.add_parser("current", help="show current provider")
+    s.set_defaults(func=cmd_current)
+
+    s = sub.add_parser("show", help="show provider details (secrets masked)")
+    s.add_argument("name")
+    s.add_argument("--reveal", action="store_true", help="show full token/key values")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("edit", help="edit provider JSON in $EDITOR")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_edit)
+
+    s = sub.add_parser(
+        "import-cc-switch", help="import providers from ~/.cc-switch/cc-switch.db"
+    )
+    s.set_defaults(func=cmd_import_cc_switch)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
