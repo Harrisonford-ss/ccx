@@ -51,6 +51,48 @@ CYAN = "\033[36m"
 MAGENTA = "\033[35m"
 RESET = "\033[0m"
 
+# ── endpoint compatibility ──────────────────────────────────
+# Per-provider tag describing what API surface the endpoint speaks.
+# Default is "anthropic" — preserves existing behavior for old configs.
+
+COMPAT_VALUES = ("anthropic", "openai", "auto")
+COMPAT_DEFAULT = "anthropic"
+COMPAT_LABEL = {
+    "anthropic": "Anthropic-compatible (Uses /messages)",
+    "openai":    "OpenAI-compatible",
+    "auto":      "Unknown (detect automatically)",
+}
+
+
+def get_compat(p: dict) -> str:
+    v = (p or {}).get("endpoint_compat") or COMPAT_DEFAULT
+    return v if v in COMPAT_VALUES else COMPAT_DEFAULT
+
+
+def prompt_compat(default: str = COMPAT_DEFAULT) -> str:
+    """Interactive radio-style picker for endpoint compatibility."""
+    print(f"\n  {BOLD}Endpoint compatibility{RESET}")
+    for i, val in enumerate(COMPAT_VALUES, 1):
+        marker = f"{GREEN}●{RESET}" if val == default else f"{DIM}○{RESET}"
+        print(f"  {marker} {CYAN}{i}{RESET}  {COMPAT_LABEL[val]}")
+    default_idx = COMPAT_VALUES.index(default) + 1
+    try:
+        choice = input(f"  {BOLD}Choose [{default_idx}]:{RESET} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return default
+    if not choice:
+        return default
+    try:
+        idx = int(choice) - 1
+        if 0 <= idx < len(COMPAT_VALUES):
+            return COMPAT_VALUES[idx]
+    except ValueError:
+        pass
+    if choice in COMPAT_VALUES:
+        return choice
+    return default
+
 
 def is_managed(key: str) -> bool:
     return key.startswith(MANAGED_PREFIXES) or key in MANAGED_EXACT
@@ -183,10 +225,12 @@ def print_current_status(cfg: dict) -> None:
         env = p.get("env", {})
         url = env.get("ANTHROPIC_BASE_URL", "")
         model = env.get("ANTHROPIC_MODEL", "")
+        compat = get_compat(p)
         print(f"  {DIM}Current:{RESET}  {BOLD}{GREEN}{p.get('name', cur)}{RESET}")
         if model:
             print(f"  {DIM}Model:{RESET}    {model}")
         print(f"  {DIM}URL:{RESET}      {url}")
+        print(f"  {DIM}Compat:{RESET}   {compat}")
     else:
         print(f"  {DIM}Current:{RESET}  {YELLOW}Account Login (official){RESET}")
     print()
@@ -230,9 +274,11 @@ def interactive_switch(cfg: dict) -> None:
         env = p.get("env", {})
         url = env.get("ANTHROPIC_BASE_URL", "?")
         model = env.get("ANTHROPIC_MODEL", "")
+        compat = get_compat(p)
         marker = f"{GREEN}●{RESET}" if key == cur else " "
         model_str = f" {DIM}[{model}]{RESET}" if model else ""
-        print(f"  {marker} {CYAN}{i}{RESET}  {BOLD}{key}{RESET}  {DIM}{url}{RESET}{model_str}")
+        compat_str = f" {DIM}<{compat}>{RESET}"
+        print(f"  {marker} {CYAN}{i}{RESET}  {BOLD}{key}{RESET}  {DIM}{url}{RESET}{model_str}{compat_str}")
 
     print(f"\n  {CYAN}0{RESET}  {DIM}Back to main menu{RESET}")
     print()
@@ -356,16 +402,18 @@ def interactive_add(cfg: dict) -> None:
     if not model:
         model = "claude-sonnet-4-5"
 
+    compat = prompt_compat()
+
     env = {
         "ANTHROPIC_BASE_URL": url,
         "ANTHROPIC_AUTH_TOKEN": token,
         "ANTHROPIC_MODEL": model,
     }
 
-    cfg["providers"][name] = {"env": env}
+    cfg["providers"][name] = {"env": env, "endpoint_compat": compat}
     save_ccx(cfg)
 
-    print(f"\n  {GREEN}Added {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+    print(f"\n  {GREEN}Added {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}  {DIM}<{compat}>{RESET}")
 
     try:
         switch_now = input(f"  {BOLD}Switch to it now? [Y/n]:{RESET} ").strip().lower()
@@ -505,9 +553,11 @@ def cmd_list(_args) -> int:
         env = p.get("env", {})
         url = env.get("ANTHROPIC_BASE_URL", "?")
         model = env.get("ANTHROPIC_MODEL", "")
+        compat = get_compat(p)
         marker = f"{GREEN}*{RESET}" if key == cur else " "
         model_str = f" {DIM}[{model}]{RESET}" if model else ""
-        print(f"  {marker} {BOLD}{key}{RESET}  {DIM}{url}{RESET}{model_str}")
+        compat_str = f" {DIM}<{compat}>{RESET}"
+        print(f"  {marker} {BOLD}{key}{RESET}  {DIM}{url}{RESET}{model_str}{compat_str}")
     print()
     return 0
 
@@ -525,7 +575,8 @@ def cmd_current(_args) -> int:
     env = p.get("env", {})
     url = env.get("ANTHROPIC_BASE_URL", "?")
     model = env.get("ANTHROPIC_MODEL", "")
-    print(f"{GREEN}{BOLD}{cur}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+    compat = get_compat(p)
+    print(f"{GREEN}{BOLD}{cur}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}  {DIM}<{compat}>{RESET}")
     return 0
 
 
@@ -610,9 +661,13 @@ def cmd_add(args) -> int:
     if args.opus:
         env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = args.opus
 
-    cfg["providers"][name] = {"env": env}
+    compat = (args.compat or COMPAT_DEFAULT).lower()
+    if compat not in COMPAT_VALUES:
+        die(f"--compat must be one of {', '.join(COMPAT_VALUES)}")
+
+    cfg["providers"][name] = {"env": env, "endpoint_compat": compat}
     save_ccx(cfg)
-    print(f"{GREEN}Added {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}")
+    print(f"{GREEN}Added {BOLD}{name}{RESET}  {DIM}{url}{RESET}  {DIM}[{model}]{RESET}  {DIM}<{compat}>{RESET}")
     return 0
 
 
@@ -679,10 +734,12 @@ def cmd_show(args) -> int:
         die(f"provider '{name}' not found")
     p = cfg["providers"][name]
     env = p.get("env", {})
-    print(f"\n  {BOLD}{name}{RESET}\n")
+    compat = get_compat(p)
+    print(f"\n  {BOLD}{name}{RESET}  {DIM}<{compat}>{RESET}\n")
     for k, v in env.items():
         display = mask(str(v)) if looks_secret(k) else str(v)
         print(f"    {CYAN}{k}{RESET} = {display}")
+    print(f"    {CYAN}endpoint_compat{RESET} = {compat}  {DIM}({COMPAT_LABEL[compat]}){RESET}")
     print()
     return 0
 
@@ -738,6 +795,26 @@ def cmd_import_cc_switch(_args) -> int:
     return 0
 
 
+def cmd_compat(args) -> int:
+    cfg = load_ccx()
+    name = args.name
+    if name not in cfg["providers"]:
+        die(f"provider '{name}' not found")
+    if args.value is None:
+        # show current
+        p = cfg["providers"][name]
+        compat = get_compat(p)
+        print(f"{BOLD}{name}{RESET}  {DIM}<{compat}>{RESET}  {COMPAT_LABEL[compat]}")
+        return 0
+    val = args.value.lower()
+    if val not in COMPAT_VALUES:
+        die(f"value must be one of {', '.join(COMPAT_VALUES)}")
+    cfg["providers"][name]["endpoint_compat"] = val
+    save_ccx(cfg)
+    print(f"{GREEN}Set {BOLD}{name}{RESET} compat to {DIM}<{val}>{RESET}  {COMPAT_LABEL[val]}")
+    return 0
+
+
 def cmd_reset(_args) -> int:
     cfg = load_ccx()
     backup_settings()
@@ -786,6 +863,12 @@ def build_parser() -> argparse.ArgumentParser:
     s_add.add_argument("--haiku", help="haiku model override")
     s_add.add_argument("--sonnet", help="sonnet model override")
     s_add.add_argument("--opus", help="opus model override")
+    s_add.add_argument(
+        "--compat",
+        choices=COMPAT_VALUES,
+        default=COMPAT_DEFAULT,
+        help=f"endpoint compatibility (default: {COMPAT_DEFAULT})",
+    )
     s_add.set_defaults(func=cmd_add)
 
     # rm
@@ -802,6 +885,20 @@ def build_parser() -> argparse.ArgumentParser:
     s_show = sub.add_parser("show", help="show provider details (secrets masked)")
     s_show.add_argument("name", help="provider name")
     s_show.set_defaults(func=cmd_show)
+
+    # compat
+    s_compat = sub.add_parser(
+        "compat",
+        help="show or set a provider's endpoint compatibility",
+    )
+    s_compat.add_argument("name", help="provider name")
+    s_compat.add_argument(
+        "value",
+        nargs="?",
+        choices=COMPAT_VALUES,
+        help=f"new value ({'/'.join(COMPAT_VALUES)}); omit to show current",
+    )
+    s_compat.set_defaults(func=cmd_compat)
 
     # import
     s_imp = sub.add_parser("import-cc-switch", help="import providers from cc-switch database")
