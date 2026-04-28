@@ -24,6 +24,8 @@ from getpass import getpass
 from pathlib import Path
 from typing import Any
 
+__version__ = "1.1.1"
+
 HOME = Path.home()
 CCX_DIR = HOME / ".config" / "ccx"
 CCX_CONFIG = CCX_DIR / "config.json"
@@ -211,9 +213,12 @@ def clear_screen() -> None:
 
 
 def print_banner() -> None:
+    line = f"ccx {__version__} - Provider Manager"
+    pad = (36 - len(line)) // 2
+    centered = " " * pad + line + " " * (36 - pad - len(line))
     print(f"""
 {CYAN}╔════════════════════════════════════╗
-║{BOLD}       ccx - Provider Manager       {RESET}{CYAN}║
+║{BOLD}{centered}{RESET}{CYAN}║
 ╚════════════════════════════════════╝{RESET}
 """)
 
@@ -795,6 +800,11 @@ def cmd_import_cc_switch(_args) -> int:
     return 0
 
 
+def cmd_version(_args) -> int:
+    print(f"ccx {__version__}")
+    return 0
+
+
 def cmd_compat(args) -> int:
     cfg = load_ccx()
     name = args.name
@@ -838,6 +848,11 @@ def build_parser() -> argparse.ArgumentParser:
                "  ccx list\n"
                "  ccx reset\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "-V", "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     sub = p.add_subparsers(dest="command", metavar="CMD")
 
@@ -907,6 +922,10 @@ def build_parser() -> argparse.ArgumentParser:
     # reset
     s_reset = sub.add_parser("reset", help="reset to account login (clear env)")
     s_reset.set_defaults(func=cmd_reset)
+
+    # version
+    s_ver = sub.add_parser("version", help="print ccx version and exit")
+    s_ver.set_defaults(func=cmd_version)
 
     return p
 
